@@ -1,4 +1,4 @@
- //go:build lc_est
+//go:build lc_est
 package main
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb ../../bpf/lb_lc_est.c
@@ -16,22 +16,25 @@ import (
 	"strings"
 	"syscall"
 	"bufio"
+	"strconv"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// network interface name and backend list string
 var (
 	ifname   string
 	backends string
 )
 
-// configuration structure for parsing backend config file
-type Config struct {
-	Backends []string `json:"backends"`
+type BackendEntry struct {
+	IP   string `json:"ip"`
+	Port uint16 `json:"port"`
 }
 
-// converts IPv4 string into uint32 representation used in BPF maps
+type Config struct {
+	Backends []BackendEntry `json:"backends"`
+}
+
 func parseIPv4(s string) (uint32, error) {
 	ip := net.ParseIP(s).To4()
 	if ip == nil {
@@ -40,8 +43,7 @@ func parseIPv4(s string) (uint32, error) {
 	return binary.LittleEndian.Uint32(ip), nil
 }
 
-// add a new backend dynamically
-func addBackend(objs *lbObjects, ip string) {
+func addBackend(objs *lbObjects, ip string, port uint16) {
 
 	backIP, err := parseIPv4(ip)
 	if err != nil {
@@ -52,38 +54,33 @@ func addBackend(objs *lbObjects, ip string) {
 	key := uint32(0)
 	var count uint32
 
-	// read current backend count from map
 	err = objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		log.Println("failed reading backend count:", err)
 		return
 	}
 
-	// prevent duplicate backends
 	for i := uint32(0); i < count; i++ {
-
 		var b lbBackend
 		err := objs.lbMaps.Backends.Lookup(i, &b)
-		if err == nil && b.Ip == backIP {
-			log.Println("backend already exists:", ip)
+		if err == nil && b.Ip == backIP && b.Port == port {
+			log.Println("backend already exists:", ip, port)
 			return
 		}
 	}
 
-	// create backend entry
 	backEp := lbBackend{
 		Ip:    backIP,
+		Port:  port,
 		Conns: 0,
 	}
 
-	// insert backend at next available index
 	err = objs.lbMaps.Backends.Put(count, &backEp)
 	if err != nil {
 		log.Println("failed adding backend:", err)
 		return
 	}
 
-	// increment backend count
 	count++
 	err = objs.lbMaps.BackendCount.Put(key, count)
 	if err != nil {
@@ -91,11 +88,10 @@ func addBackend(objs *lbObjects, ip string) {
 		return
 	}
 
-	log.Println("backend added:", ip)
+	log.Println("backend added:", ip, port)
 }
 
-// delete backend dynamically (only allowed if no active connections)
-func deleteBackend(objs *lbObjects, ip string) {
+func deleteBackend(objs *lbObjects, ip string, port uint16) {
 
 	backIP, err := parseIPv4(ip)
 	if err != nil {
@@ -106,14 +102,12 @@ func deleteBackend(objs *lbObjects, ip string) {
 	key := uint32(0)
 	var count uint32
 
-	// read backend count
 	err = objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		log.Println("failed reading backend count:", err)
 		return
 	}
 
-	// search backend to delete
 	for i := uint32(0); i < count; i++ {
 
 		var b lbBackend
@@ -122,9 +116,8 @@ func deleteBackend(objs *lbObjects, ip string) {
 			continue
 		}
 
-		if b.Ip == backIP {
+		if b.Ip == backIP && b.Port == port {
 
-			// prevent deletion if backend still has active connections
 			if b.Conns != 0 {
 				log.Println("cannot delete backend, active connections:", b.Conns)
 				return
@@ -132,9 +125,7 @@ func deleteBackend(objs *lbObjects, ip string) {
 
 			last := count - 1
 
-			// keep array compact by moving last backend into deleted slot
 			if i != last {
-
 				var lastBackend lbBackend
 				err := objs.lbMaps.Backends.Lookup(last, &lastBackend)
 				if err == nil {
@@ -142,35 +133,30 @@ func deleteBackend(objs *lbObjects, ip string) {
 				}
 			}
 
-			// remove last entry
 			objs.lbMaps.Backends.Delete(last)
 
-			// decrease backend count
 			count--
 			objs.lbMaps.BackendCount.Put(key, count)
 
-			log.Println("backend deleted:", ip)
+			log.Println("backend deleted:", ip, port)
 			return
 		}
 	}
 
-	log.Println("backend not found:", ip)
+	log.Println("backend not found:", ip, port)
 }
 
-// list all configured backends and their connection counts
 func listBackends(objs *lbObjects) {
 
 	var count uint32
 	key := uint32(0)
 
-	// read backend count
 	err := objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		fmt.Println("failed to read backend count")
 		return
 	}
 
-	// iterate through backend map
 	for i := uint32(0); i < count; i++ {
 
 		var b lbBackend
@@ -179,25 +165,21 @@ func listBackends(objs *lbObjects) {
 			continue
 		}
 
-		// convert stored uint32 IP back to human readable form
 		ip := make(net.IP, 4)
 		binary.LittleEndian.PutUint32(ip, b.Ip)
 
-		fmt.Println(i, ip, "conns:", b.Conns)
+		fmt.Println(i, ip, "port:", b.Port, "conns:", b.Conns)
 	}
 }
 
 func main() {
 
-	// CLI flag for network interface
 	flag.StringVar(&ifname, "i", "lo", "Network interface to attach eBPF programs")
 
-	// config file containing initial backends
 	var configFile string
 	flag.StringVar(&configFile, "config", "configs/backends_lc.json", "Backend configuration file")
 	flag.Parse()
 
-	// read backend configuration file
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		log.Fatalf("Failed to read config file: %v", err)
@@ -213,68 +195,51 @@ func main() {
 		log.Fatal("No backends defined in config file")
 	}
 
-	// context used for graceful shutdown on Ctrl+C
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// remove memlock rlimit so BPF objects can be loaded
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("Removing memlock:", err)
 	}
 
-	// load compiled eBPF program and maps
 	var objs lbObjects
 	if err := loadLbObjects(&objs, nil); err != nil {
 		log.Fatal("Loading eBPF objects:", err)
 	}
 	defer objs.Close()
 
-	// convert backend list from config into comma-separated string
-	backends = strings.Join(cfg.Backends, ",")
+	for i, backend := range cfg.Backends {
 
-	backendList := strings.Split(backends, ",")
-
-	if len(backendList) == 0 {
-		log.Fatalf("No backend IPs found")
-	}
-
-	// populate BPF backend map
-	for i, backend := range backendList {
-
-		backend = strings.TrimSpace(backend)
-
-		backIP, err := parseIPv4(backend)
+		backIP, err := parseIPv4(backend.IP)
 		if err != nil {
-			log.Fatalf("Invalid backend IP %q: %v", backend, err)
+			log.Fatalf("Invalid backend IP %q: %v", backend.IP, err)
 		}
 
 		backEp := lbBackend{
 			Ip:    backIP,
+			Port:  backend.Port,
 			Conns: 0,
 		}
 
 		if err := objs.lbMaps.Backends.Put(uint32(i), &backEp); err != nil {
-			log.Fatalf("Error adding backend #%d (%s) to eBPF map: %v", i, backend, err)
+			log.Fatalf("Error adding backend #%d to eBPF map: %v", i, err)
 		}
 
-		log.Printf("Added backend #%d: %s", i, backend)
+		log.Printf("Added backend #%d: %s:%d", i, backend.IP, backend.Port)
 	}
 
-	// store backend count in BPF map so XDP program knows how many exist
-	count := uint32(len(backendList))
+	count := uint32(len(cfg.Backends))
 	key := uint32(0)
 
 	if err := objs.lbMaps.BackendCount.Put(key, count); err != nil {
 		log.Fatalf("Failed to update backend count map: %v", err)
 	}
 
-	// find interface index
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		log.Fatalf("Getting interface %s: %s", ifname, err)
 	}
 
-	// attach XDP program to the interface
 	xdplink, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpLoadBalancer,
 		Interface: iface.Index,
@@ -287,7 +252,6 @@ func main() {
 
 	log.Println("XDP Load Balancer successfully attached and running")
 
-	// interactive CLI loop running in separate goroutine
 	reader := bufio.NewReader(os.Stdin)
 
 	go func() {
@@ -319,21 +283,33 @@ func main() {
 
 				case "add":
 
-					if len(parts) != 2 {
-						fmt.Println("usage: add <ip>")
+					if len(parts) != 3 {
+						fmt.Println("usage: add <ip> <port>")
 						continue
 					}
 
-					addBackend(&objs, parts[1])
+					p, err := strconv.Atoi(parts[2])
+					if err != nil {
+						fmt.Println("invalid port")
+						continue
+					}
+
+					addBackend(&objs, parts[1], uint16(p))
 
 				case "del":
 
-					if len(parts) != 2 {
-						fmt.Println("usage: del <ip>")
+					if len(parts) != 3 {
+						fmt.Println("usage: del <ip> <port>")
 						continue
 					}
 
-					deleteBackend(&objs, parts[1])
+					p, err := strconv.Atoi(parts[2])
+					if err != nil {
+						fmt.Println("invalid port")
+						continue
+					}
+
+					deleteBackend(&objs, parts[1], uint16(p))
 
 				case "list":
 
@@ -341,14 +317,13 @@ func main() {
 
 				default:
 
-					fmt.Println("commands: add <ip>, del <ip>, list")
+					fmt.Println("commands: add <ip> <port>, del <ip> <port>, list")
 				}
 			}
 		}
 
 	}()
 
-	// wait for ControlC
 	<-ctx.Done()
 
 	log.Println("Received signal, exiting...")
