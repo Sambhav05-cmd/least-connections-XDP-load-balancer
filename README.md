@@ -1,5 +1,9 @@
  # XDP Weighted Least-Connections Load Balancer
 
+High-performance L4 load balancer implemented in XDP/eBPF
+supporting stateful least-connections scheduling with in-datapath
+connection tracking.
+
 A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI. The load balancer filters traffic based on a configurable set of service VIP–port pairs, allowing multiple services to be handled simultaneously while ensuring unrelated network traffic passes through unaffected.
 
 > **Why XDP?** Packets are processed before entering the Linux networking stack — minimal CPU overhead, maximum throughput.
@@ -9,6 +13,7 @@ A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two
 ## Table of Contents
 
 - [Overview](#overview)
+- [Why least connections instead of hashing](#Why-least-connections-instead-of-hashing)
 - [Scheduling Algorithms](#scheduling-algorithms)
 - [Connection Tracking Modes](#connection-tracking-modes)
 - [Repository Structure](#repository-structure)
@@ -26,6 +31,37 @@ A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two
 ## Overview
 
 Each incoming TCP connection is assigned to a backend according to the active scheduling algorithm. The XDP eBPF program tracks connection state by inspecting TCP flags and maintaining lightweight per-connection structures in eBPF maps. Because everything runs at the XDP layer, packets are intercepted on arrival — before the kernel's normal network stack — keeping overhead very low.
+
+---
+
+## Why Least-Connections instead of Hash-Based Load Balancing
+
+High-performance L4 load balancers in fast datapaths (including most XDP-based designs) commonly rely on **stateless flow hashing** (e.g., 5-tuple hashing) for backend selection.  
+Hashing offers constant-time scheduling decisions and minimal per-packet overhead, making it attractive for high-throughput environments.
+
+However, this approach has important practical limitations.
+
+- Hashing assumes that traffic load is **evenly distributed across connections**, which is often not true in real deployments.
+- Long-lived or high-throughput persistent connections (such as WebSockets, database sessions, or streaming RPC workloads) can create **significant load imbalance**, even when flow counts appear uniform.
+- Stateless hashing cannot adapt to runtime backend load conditions because flow-to-backend mapping is deterministic for the lifetime of the connection.
+
+A further challenge arises when **backend capacity changes dynamically**.
+
+- Adjusting backend weights in a hashing-based scheduler typically requires **rehashing or remapping flows**, which can lead to:
+  - sudden traffic shifts
+  - connection churn
+  - cache and state disruption on backends
+- Incremental or fine-grained runtime weight updates are therefore difficult to apply without affecting existing traffic distribution.
+
+This project explores **stateful least-connections scheduling implemented directly in the XDP datapath**, enabling adaptive backend selection based on live connection counts and configurable backend weights.
+
+By maintaining lightweight per-connection state in eBPF maps, the load balancer:
+
+- reacts to real-time load imbalance instead of relying on static flow distribution  
+- supports dynamic backend addition, removal, and weight updates without rehashing existing connections  
+- performs scheduling entirely in the fast path without requiring backend-side load reporting  
+
+This design trades modest state-management overhead for **improved utilisation fairness, smoother weight transitions, and better handling of persistent or skewed workloads**, while still benefiting from the high throughput of XDP-based packet processing.
 
 ---
 
