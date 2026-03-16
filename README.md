@@ -1,6 +1,6 @@
  # XDP Weighted Least-Connections Load Balancer
 
-A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI.
+A NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI. The load balancer filters traffic based on a configurable set of service VIP–port pairs, allowing multiple services to be handled simultaneously while ensuring unrelated network traffic passes through unaffected.
 
 > **Why XDP?** Packets are processed before entering the Linux networking stack — minimal CPU overhead, maximum throughput.
 
@@ -78,42 +78,49 @@ sudo ./scripts/llvm.sh
 
 ## Configuration
 
+The load balancer is configured using a **virtual service endpoint (VIP + port)** and a pool of backend servers.
 ### LC — `configs/backends_lc.json`
 
 ```json
 {
+  "service": {
+    "vip": "10.45.179.173",
+    "port": 8000
+  },
   "backends": [
     {
-      "ip": "10.45.179.99",
+      "ip": "10.45.179.166",
       "port": 8000
     },
     {
-      "ip": "10.45.179.166",
+      "ip": "10.45.179.99",
       "port": 8000
     }
   ]
 }
-
 ```
 
 ### WLC — `configs/backends_wlc.json`
 
 ```json
 {
+  "service": {
+    "vip": "10.45.179.173",
+    "port": 8000
+  },
   "backends": [
     {
-      "ip": "10.45.179.99",
+      "ip": "10.45.179.166",
       "port": 8000,
       "weight": 80
     },
     {
-      "ip": "10.45.179.46",
+      "ip": "10.45.179.99",
       "port": 8000,
       "weight": 20
     }
   ]
 }
-
 ```
 
 Backends can also be added, removed, or reweighted live via the CLI after startup.
