@@ -1,10 +1,13 @@
  # XDP Weighted Least-Connections NAT Load Balancer
+ 
+A high-performance Layer-4 load balancer built in the XDP/eBPF fast path, providing stateful connection-aware scheduling with full NAT semantics.
 
-High-performance L4 load balancer implemented in XDP/eBPF
-supporting stateful least-connections scheduling with in-datapath
-connection tracking.
+The dataplane performs connection tracking, backend selection, and bidirectional address rewriting entirely before packets enter the Linux networking stack, enabling low-latency and high-throughput load distribution under heavy connection concurrency.
 
-It is a NAT-based TCP load balancer implemented in eBPF at the XDP layer. Supports two scheduling algorithms — **Least Connections (LC)** and **Weighted Least Connections (WLC)** — each available in two connection-tracking modes. Backends are manageable at runtime via an interactive CLI. The load balancer filters traffic based on a configurable set of service VIP–port pairs, allowing multiple services to be handled simultaneously while ensuring unrelated network traffic passes through unaffected.
+The system supports both Least-Connections (LC) and Weighted Least-Connections (WLC) scheduling, each available with selectable connection accounting modes.
+Backend pools and virtual service endpoints (VIP–port pairs) can be added, removed, or updated dynamically at runtime through an interactive CLI, without restarting the dataplane.
+
+Traffic is steered only for configured services, allowing unrelated network flows to pass through the interface unaffected.
 
 > **Why XDP?** Packets are processed before entering the Linux networking stack — minimal CPU overhead, maximum throughput.
 
@@ -15,6 +18,7 @@ It is a NAT-based TCP load balancer implemented in eBPF at the XDP layer. Suppor
 - [Overview](#overview)
 - [Capabilities](#Capabilities)
 - [Why least connections instead of hashing](#Why-least-connections-instead-of-hashing)
+- [Suitable Deployment Scenarios](#Suitable-Deployment-Scenarios)
 - [Scheduling Algorithms](#scheduling-algorithms)
 - [Connection Tracking Modes](#connection-tracking-modes)
 - [Repository Structure](#repository-structure)
@@ -45,7 +49,21 @@ This architecture allows the load balancer to adapt to skewed or persistent traf
 ---
 
 ## Key capabilities
+-Least-Connections and Weighted Least-Connections scheduling
 
+-In-datapath TCP connection tracking
+
+-Full NAT (forward and reverse path rewriting)
+
+-Multiple virtual services (VIP–port endpoints) with runtime add/remove support
+
+-Runtime backend addition, removal, and weight updates
+
+-Stable traffic distribution under bursty or long-lived connections
+
+Because scheduling decisions are made using real-time connection counts, the load balancer adapts automatically to uneven traffic patterns and backend capacity differences while retaining the performance benefits of early ingress processing with XDP.
+
+The design is suitable for practical high-concurrency environments where stateless hashing leads to load imbalance or poor utilisation fairness.
 
 ---
 
@@ -78,6 +96,15 @@ By maintaining lightweight per-connection state in eBPF maps, the load balancer:
 
 This design trades modest state-management overhead for **improved utilisation fairness, smoother weight transitions, and better handling of persistent or skewed workloads**, while still benefiting from the high throughput of XDP-based packet processing.
 
+---
+## Suitable Deployment Scenarios
+- Backend identity must remain private : Full NAT hides real server IPs and prevents clients from directly addressing backend nodes.
+-Controlled ingress or gateway-style deployments : Centralised entry point simplifies firewalling, policy enforcement, and network segmentation.
+-Persistent or long-lived connection workloads : Better distribution than hash-based scheduling for WebSockets, streaming services, or database sessions.
+-Heterogeneous backend capacity : Weighted least-connections enables proportional load distribution across unequal servers.
+
+High concurrent connection environments
+XDP fast-path processing keeps per-packet overhead low even with stateful scheduling.
 ---
 
 ## Scheduling Algorithms
