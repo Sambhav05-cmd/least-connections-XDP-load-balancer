@@ -448,7 +448,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
       ct_key.port = bpf_htons(p);
       ct_port = bpf_htons(p);
       ct_key.ip = b->ip;
-      ct_port = ct_key.port;
 
       struct conn_meta meta = {};
       meta.ip = ip->saddr;
