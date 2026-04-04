@@ -25,6 +25,8 @@ struct backend
   __u32 ip;
   __u16 port;
   __u32 conns;
+  __u16 weight;
+  __u32 used_count; // Holds the number of times the backend has been used in its current cycle
 };
 
 // Connection state lives ONLY here (conntrack map).
@@ -43,6 +45,9 @@ struct conn_meta
   __u16 service_port;
 };
 
+// Backend IPs
+// We could also include port information but we simplify
+// and assume that both LB and Backend listen on the same port for requests
 struct
 {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -67,6 +72,15 @@ struct
   __type(key, __u32);
   __type(value, __u32);
 } backend_count SEC(".maps");
+
+// Holds the next backend_idx to be used
+struct
+{
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} scheduler_state SEC(".maps");
 
 // conntrack: keyed by (LB-side five-tuple as seen FROM the backend)
 //   src_ip   = LB IP
@@ -401,36 +415,34 @@ int xdp_load_balancer(struct xdp_md *ctx)
       bpf_printk("yessss");
 
       __u32 key = 0;
-      __u32 min_conn = (__u32)-1;
-
       __u32 zero = 0;
       __u32 *num_backends = bpf_map_lookup_elem(&backend_count, &zero);
       if (!num_backends)
+        return XDP_ABORTED;
+
+      __u32 *curr_idx = bpf_map_lookup_elem(&scheduler_state, &zero);
+      if (!curr_idx)
       {
-        bpf_printk("ABORT_2 backend_count_lookup_failed");
         return XDP_ABORTED;
       }
 
-      for (__u32 i = 0; i < MAX_BACKENDS; i++)
-      {
-        if (i >= *num_backends)
-        {
-          break;
-        }
-        __u32 k = i;
-        struct backend *cand = bpf_map_lookup_elem(&backends, &k);
-        if (cand && cand->conns < min_conn)
-        {
-          min_conn = cand->conns;
-          key = k;
-        }
-      }
+      key = *curr_idx;
 
       b = bpf_map_lookup_elem(&backends, &key);
       if (!b)
       {
         bpf_printk("ABORT_3 selected_backend_lookup_failed");
         return XDP_ABORTED;
+      }
+
+      b->used_count += 1; //Increment used_count as we are adding a new connection to this backend
+
+      //Only after using this backend in accordance to its weight will the following if-statement be fulfilled
+      if (b->used_count >= b->weight) //Check whether used_count is equal to the backend's weight
+      {
+        b->used_count = 0; //Set used_count to 0 when it completes its weight
+        __u32 next_idx = (key + 1) % *num_backends; //Increment the index to point to the next backend
+        bpf_map_update_elem(&scheduler_state, &zero, &next_idx, BPF_ANY);  //Update index in scheduler_state map
       }
 
       // find available port for translation and insert into port_ownership map
@@ -445,6 +457,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       ct_key.port = bpf_htons(p);
       ct_port = bpf_htons(p);
       ct_key.ip = b->ip;
+      ct_port = ct_key.port;
 
       struct conn_meta meta = {};
       meta.ip = ip->saddr;
@@ -465,19 +478,12 @@ int xdp_load_balancer(struct xdp_md *ctx)
         bpf_printk("ABORT_5 port_ownership_insert_failed");
         return XDP_ABORTED;
       }
-
-      // Increment connection counter for the backend
-      struct backend nb = *b;
-      nb.conns += 1;
-      bpf_map_update_elem(&backends, &key, &nb, BPF_ANY);
-
       bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
                  &ip->saddr, bpf_ntohs(tcp->source), &b->ip);
     }
     else
-    {
+    { // existing connection, look up backend and port translation info for forwarding
       ct_key = *ct_key_pointer;
-      // Existing connection: look up the live conn_meta
       ct = bpf_map_lookup_elem(&conntrack, &ct_key);
       if (!ct)
         return XDP_ABORTED;
@@ -493,8 +499,12 @@ int xdp_load_balancer(struct xdp_md *ctx)
         // Only one write needed , port_ownership points here
         bpf_map_update_elem(&conntrack, &ct_key, &updated, BPF_ANY);
 
+        // Increment connection counter for the backend
+        struct backend nb = *b;
+        nb.conns += 1;
+        bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
         bpf_printk("conn established : Backend %pI4 conns=%d",
-                   &b->ip, b->conns);
+                   &b->ip, nb.conns);
         ct = bpf_map_lookup_elem(&conntrack, &ct_key);
         if (!ct)
           return XDP_ABORTED;
