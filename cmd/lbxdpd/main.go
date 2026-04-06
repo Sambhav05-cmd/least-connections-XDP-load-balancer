@@ -4,6 +4,10 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb2 ../../bpf/lb_lc_syn.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb3 ../../bpf/lb_wlc_est.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb4 ../../bpf/lb_wlc_syn.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb5 ../../bpf/lb_rr_est.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb6 ../../bpf/lb_rr_syn.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb7 ../../bpf/lb_wrr_est.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb8 ../../bpf/lb_wrr_syn.c
 
 import (
 	"context"
@@ -23,14 +27,14 @@ import (
 	"google.golang.org/grpc"
 )
 
-// variant is the unified interface implemented by all four combinations of
-// (algo=lc|wlc) × (mode=est|syn).
+// variant is the unified interface implemented by all combinations of
+// (algo=lc|wlc|rr|wrr) × (mode=est|syn).
 type variant interface {
 	Program() *ebpf.Program
 	Init(cfgPath string) error
 	Close()
 
-	// Weight update is a no-op for lc variants.
+	// Weight update is a no-op for lc and rr variants.
 	UpdateWeight(ip string, port uint16, weight uint16) error
 
 	AddBackend(ip string, port uint16, weight uint16) error
@@ -41,15 +45,23 @@ type variant interface {
 
 func main() {
 	iface   := flag.String("i", "lo", "network interface to attach XDP program to")
-	algo    := flag.String("algo", "lc", "load-balancing algorithm: lc (least-conn) or wlc (weighted least-conn)")
+	algo    := flag.String("algo", "lc", "load-balancing algorithm: lc, wlc, rr, or wrr")
 	mode    := flag.String("mode", "est", "connection-tracking mode: est or syn")
 	cfgPath := flag.String("config", "", "path to backends config JSON (default: configs/backends_<algo>.json)")
 	sock    := flag.String("sock", "/var/run/lbxdpd.sock", "gRPC unix socket path")
 	flag.Parse()
 
 	// Default config path based on algo when not explicitly set.
+	// rr reuses lc config; wrr reuses wlc config.
 	if *cfgPath == "" {
-		*cfgPath = "configs/backends_" + *algo + ".json"
+		switch *algo {
+		case "rr":
+			*cfgPath = "configs/backends_lc.json"
+		case "wrr":
+			*cfgPath = "configs/backends_wlc.json"
+		default:
+			*cfgPath = "configs/backends_" + *algo + ".json"
+		}
 	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -81,8 +93,26 @@ func main() {
 		default:
 			log.Fatalf("unknown mode %q — want est or syn", *mode)
 		}
+	case "rr":
+		switch *mode {
+		case "est":
+			v, err = newRrEstVariant()
+		case "syn":
+			v, err = newRrSynVariant()
+		default:
+			log.Fatalf("unknown mode %q — want est or syn", *mode)
+		}
+	case "wrr":
+		switch *mode {
+		case "est":
+			v, err = newWrrEstVariant()
+		case "syn":
+			v, err = newWrrSynVariant()
+		default:
+			log.Fatalf("unknown mode %q — want est or syn", *mode)
+		}
 	default:
-		log.Fatalf("unknown algo %q — want lc or wlc", *algo)
+		log.Fatalf("unknown algo %q — want lc, wlc, rr, or wrr", *algo)
 	}
 	if err != nil {
 		log.Fatalf("create variant: %v", err)
@@ -120,8 +150,8 @@ func main() {
 		}
 	}()
 
-	// Adaptive weight loop is a no-op for now but only started in wlc mode.
-	if *algo == "wlc" {
+	// Adaptive weight loop only started in weighted modes.
+	if *algo == "wlc" || *algo == "wrr" {
 		go adaptiveLoop()
 	}
 

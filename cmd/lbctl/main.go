@@ -18,7 +18,7 @@ import (
 
 const (
 	pinDir     = "/sys/fs/bpf/lbxdp"
-	daemonSock = "/var/run/lbxdp-wlc.sock"
+	daemonSock = "/var/run/lbxdpd.sock"
 )
 
 func main() {
@@ -40,21 +40,21 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `lbctl — XDP load balancer control
 
-Backend commands (pinned map access, works with lc and wlc):
-  lbctl add    <ip> <port> [weight]   add backend (weight ignored in lc algo)
+Backend commands (pinned map access, works with lc, wlc, rr, and wrr):
+  lbctl add    <ip> <port> [weight]   add backend (weight ignored in lc/rr algo)
   lbctl del    <ip> <port>            remove backend (refused if active conns > 0)
   lbctl list                          list backends with connection counts
 
-Service commands (pinned map access, works with lc and wlc):
+Service commands (pinned map access, works with lc, wlc, rr, and wrr):
   lbctl addsvc  <vip> <port>          register a virtual IP
   lbctl delsvc  <vip> <port>          deregister a virtual IP
   lbctl listsvc                       list registered VIPs
 
-Weight command (gRPC, wlc algo only):
+Weight command (gRPC, wlc/wrr algo only):
   lbctl weight <ip> <port> <weight>   update a backend's weight live`)
 }
 
-// ── gRPC path (wlc weight updates) ───────────────────────────────────────────
+// ── gRPC path ─────────────────────────────────────────────────────────────────
 
 func runGRPCCmd() {
 	if len(os.Args) < 5 {
@@ -67,7 +67,7 @@ func runGRPCCmd() {
 	conn, err := grpc.NewClient("unix://"+daemonSock,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		fatalf("connect to wlc daemon: %v", err)
+		fatalf("connect to daemon: %v", err)
 	}
 	defer conn.Close()
 
@@ -83,10 +83,11 @@ func runGRPCCmd() {
 	fmt.Printf("weight updated: %s:%d → %d\n", ip, port, weight)
 }
 
-// ── pinned map path (backends + services) ─────────────────────────────────────
+// ── pinned map path ───────────────────────────────────────────────────────────
 
-// lcBackend matches lbBackend/lb2Backend — no Weight field.
+// lcBackend matches lbBackend/lb2Backend/lb5Backend/lb6Backend.
 // C layout: ip(4) port(2) pad(2) conns(4)
+// Port stored as htons.
 type lcBackend struct {
 	Ip    uint32
 	Port  uint16
@@ -94,9 +95,9 @@ type lcBackend struct {
 	Conns uint32
 }
 
-// wlcBackend matches lb3Backend/lb4Backend.
-// Actual compiled C layout: ip(4) port(2) pad(2) conns(4) weight(2) pad(2)
-// __u32 conns is aligned to offset 8 by the compiler, pushing weight after it.
+// wlcBackend matches lb3Backend/lb4Backend/lb7Backend/lb8Backend.
+// C layout: ip(4) port(2) pad(2) conns(4) weight(2) pad(2)
+// Port stored RAW (host order) — BPF C does its own byte-order handling.
 type wlcBackend struct {
 	Ip     uint32
 	Port   uint16
@@ -106,7 +107,20 @@ type wlcBackend struct {
 	Pad1   uint16
 }
 
-// serviceKey matches lbIpPort/lb2IpPort/lb3IpPort/lb4IpPort.
+// wrrBackend matches lb7Backend/lb8Backend — same as wlcBackend + UsedCount.
+// C layout: ip(4) port(2) pad(2) conns(4) weight(2) pad(2) used_count(4)
+// Port stored RAW (host order).
+type wrrBackend struct {
+	Ip        uint32
+	Port      uint16
+	Pad0      uint16
+	Conns     uint32
+	Weight    uint16
+	Pad1      uint16
+	UsedCount uint32
+}
+
+// serviceKey matches all IpPort types.
 // C layout: ip(4) port(2) pad(2)
 type serviceKey struct {
 	Ip   uint32
@@ -135,11 +149,8 @@ func runMapMode() {
 	}
 	defer servicesMap.Close()
 
-	// conntrack is only needed for wlc del (to patch BackendIdx after swap).
-	// We find it by looking up the XDP program's map list, matching by name,
-	// so we always get the map the running BPF program actually uses.
 	var conntrackMap *ebpf.Map
-	if mode == "wlc" && len(os.Args) >= 2 && os.Args[1] == "del" {
+	if (mode == "wlc" || mode == "wrr") && len(os.Args) >= 2 && os.Args[1] == "del" {
 		conntrackMap = findConntrackMap()
 		if conntrackMap != nil {
 			defer conntrackMap.Close()
@@ -149,8 +160,6 @@ func runMapMode() {
 	}
 
 	switch os.Args[1] {
-
-	// ── backend commands ───────────────────────────────────────────────────────
 
 	case "add":
 		if len(os.Args) < 4 {
@@ -174,8 +183,6 @@ func runMapMode() {
 
 	case "list":
 		listBackends(backendsMap, countMap, mode)
-
-	// ── service commands ───────────────────────────────────────────────────────
 
 	case "addsvc":
 		if len(os.Args) < 4 {
@@ -220,8 +227,6 @@ func runMapMode() {
 	}
 }
 
-// readMode reads the sentinel written by the daemon at startup.
-// Returns "lc" or "wlc". Defaults to "lc" if the file is missing.
 func readMode() string {
 	data, err := os.ReadFile("/run/lbxdp.mode")
 	if err != nil {
@@ -231,6 +236,10 @@ func readMode() string {
 }
 
 // ── backend operations ────────────────────────────────────────────────────────
+//
+// Port convention (mirrors variants.go exactly):
+//   lc / rr  → stored as htons; lbctl writes htons, compares with htons, displays with ntohs
+//   wlc / wrr → stored RAW;    lbctl writes raw,   compares raw,          displays raw
 
 func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16, mode string) {
 	var count uint32
@@ -238,15 +247,24 @@ func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16,
 		fatalf("lookup count: %v", err)
 	}
 
-	if mode == "wlc" {
+	switch mode {
+	case "wlc":
 		if wlcFindIdx(backendsMap, count, ip, port) >= 0 {
-			fatalf("backend %s:%d already exists", ipToStr(ip), ntohs(port))
+			fatalf("backend %s:%d already exists", ipToStr(ip), port)
 		}
-		be := wlcBackend{Ip: ip, Port: htons(port), Conns: 0, Weight: weight}
+		be := wlcBackend{Ip: ip, Port: port, Conns: 0, Weight: weight}
 		if err := backendsMap.Update(count, &be, ebpf.UpdateAny); err != nil {
 			fatalf("insert backend: %v", err)
 		}
-	} else {
+	case "wrr":
+		if wrrFindIdx(backendsMap, count, ip, port) >= 0 {
+			fatalf("backend %s:%d already exists", ipToStr(ip), port)
+		}
+		be := wrrBackend{Ip: ip, Port: port, Conns: 0, Weight: weight, UsedCount: 0}
+		if err := backendsMap.Update(count, &be, ebpf.UpdateAny); err != nil {
+			fatalf("insert backend: %v", err)
+		}
+	default: // lc and rr
 		if lcFindIdx(backendsMap, count, ip, port) >= 0 {
 			fatalf("backend %s:%d already exists", ipToStr(ip), ntohs(port))
 		}
@@ -260,21 +278,20 @@ func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16,
 	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
 		fatalf("update count: %v", err)
 	}
-	fmt.Printf("backend added: %s:%d\n", ipToStr(ip), ntohs(port))
+	fmt.Printf("backend added: %s:%d\n", ipToStr(ip), port)
 }
 
-// delBackend performs a swap-delete on the dense array and patches conntrack
-// (for wlc mode) so existing connections keep pointing at the correct backend slot.
 func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port uint16, mode string) {
 	var count uint32
 	if err := countMap.Lookup(uint32(0), &count); err != nil {
 		fatalf("lookup count: %v", err)
 	}
 
-	if mode == "wlc" {
+	switch mode {
+	case "wlc":
 		idx := wlcFindIdx(backendsMap, count, ip, port)
 		if idx < 0 {
-			fatalf("backend %s:%d not found", ipToStr(ip), ntohs(port))
+			fatalf("backend %s:%d not found", ipToStr(ip), port)
 		}
 		var cur wlcBackend
 		if err := backendsMap.Lookup(uint32(idx), &cur); err != nil {
@@ -292,7 +309,6 @@ func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port u
 			if err := backendsMap.Update(uint32(idx), &lb, ebpf.UpdateExist); err != nil {
 				fatalf("swap: %v", err)
 			}
-			// Patch conntrack: every entry with BackendIdx==last must now use idx.
 			if conntrackMap != nil {
 				if err := patchConntrackRaw(conntrackMap, last, uint32(idx)); err != nil {
 					fatalf("patch conntrack: %v", err)
@@ -303,7 +319,40 @@ func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port u
 		if err := backendsMap.Update(last, &zero, ebpf.UpdateExist); err != nil {
 			fatalf("zero last slot: %v", err)
 		}
-	} else {
+
+	case "wrr":
+		idx := wrrFindIdx(backendsMap, count, ip, port)
+		if idx < 0 {
+			fatalf("backend %s:%d not found", ipToStr(ip), port)
+		}
+		var cur wrrBackend
+		if err := backendsMap.Lookup(uint32(idx), &cur); err != nil {
+			fatalf("lookup backend: %v", err)
+		}
+		if cur.Conns != 0 {
+			fatalf("backend has %d active connections — refusing delete", cur.Conns)
+		}
+		last := count - 1
+		if uint32(idx) != last {
+			var lb wrrBackend
+			if err := backendsMap.Lookup(last, &lb); err != nil {
+				fatalf("lookup last: %v", err)
+			}
+			if err := backendsMap.Update(uint32(idx), &lb, ebpf.UpdateExist); err != nil {
+				fatalf("swap: %v", err)
+			}
+			if conntrackMap != nil {
+				if err := patchConntrackRaw(conntrackMap, last, uint32(idx)); err != nil {
+					fatalf("patch conntrack: %v", err)
+				}
+			}
+		}
+		zero := wrrBackend{}
+		if err := backendsMap.Update(last, &zero, ebpf.UpdateExist); err != nil {
+			fatalf("zero last slot: %v", err)
+		}
+
+	default: // lc and rr
 		idx := lcFindIdx(backendsMap, count, ip, port)
 		if idx < 0 {
 			fatalf("backend %s:%d not found", ipToStr(ip), ntohs(port))
@@ -335,7 +384,7 @@ func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port u
 	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
 		fatalf("update count: %v", err)
 	}
-	fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), ntohs(port))
+	fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), port)
 }
 
 func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
@@ -347,16 +396,28 @@ func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
 		fmt.Println("no backends registered")
 		return
 	}
-	if mode == "wlc" {
+	switch mode {
+	case "wlc":
 		for i := uint32(0); i < count; i++ {
 			var b wlcBackend
 			if err := backendsMap.Lookup(i, &b); err != nil {
 				continue
 			}
+			// Port is RAW for wlc — display directly
 			fmt.Printf("%d: %s:%d  weight=%d  conns=%d\n",
-				i, ipToStr(b.Ip), ntohs(b.Port), b.Weight, b.Conns)
+				i, ipToStr(b.Ip), b.Port, b.Weight, b.Conns)
 		}
-	} else {
+	case "wrr":
+		for i := uint32(0); i < count; i++ {
+			var b wrrBackend
+			if err := backendsMap.Lookup(i, &b); err != nil {
+				continue
+			}
+			// Port is RAW for wrr — display directly
+			fmt.Printf("%d: %s:%d  weight=%d  used=%d  conns=%d\n",
+				i, ipToStr(b.Ip), b.Port, b.Weight, b.UsedCount, b.Conns)
+		}
+	default: // lc and rr — port stored as htons, must ntohs to display
 		for i := uint32(0); i < count; i++ {
 			var b lcBackend
 			if err := backendsMap.Lookup(i, &b); err != nil {
@@ -368,21 +429,35 @@ func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
 	}
 }
 
-// wlcFindIdx scans backends[0..count) for ip:port, returns index or -1.
+// wlcFindIdx: port stored RAW — compare raw vs raw.
 func wlcFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
 	for i := uint32(0); i < count; i++ {
 		var b wlcBackend
 		if err := backendsMap.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == ip && b.Port == htons(port) {
+		if b.Ip == ip && b.Port == port {
 			return int(i)
 		}
 	}
 	return -1
 }
 
-// lcFindIdx is the linear scan for lc mode.
+// wrrFindIdx: port stored RAW — compare raw vs raw.
+func wrrFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
+	for i := uint32(0); i < count; i++ {
+		var b wrrBackend
+		if err := backendsMap.Lookup(i, &b); err != nil {
+			continue
+		}
+		if b.Ip == ip && b.Port == port {
+			return int(i)
+		}
+	}
+	return -1
+}
+
+// lcFindIdx: port stored as htons — compare htons vs htons.
 func lcFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
 	for i := uint32(0); i < count; i++ {
 		var b lcBackend
@@ -398,11 +473,7 @@ func lcFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int 
 
 // ── conntrack patching ────────────────────────────────────────────────────────
 
-// findConntrackMap finds the conntrack map used by the attached XDP program
-// by iterating all loaded BPF programs, finding xdp_load_balancer, then
-// iterating its map ids and returning the one named "conntrack".
 func findConntrackMap() *ebpf.Map {
-	// Walk all programs looking for xdp_load_balancer
 	progID := ebpf.ProgramID(0)
 	for {
 		nextID, err := ebpf.ProgramGetNextID(progID)
@@ -421,7 +492,6 @@ func findConntrackMap() *ebpf.Map {
 			continue
 		}
 
-		// Found the XDP program — get its map IDs
 		mapIDs, _ := info.MapIDs()
 		for _, mid := range mapIDs {
 			m, err := ebpf.NewMapFromID(mid)
@@ -442,15 +512,12 @@ func findConntrackMap() *ebpf.Map {
 	return nil
 }
 
-// ctKey mirrors struct ip_port used as conntrack map key.
 type ctKey struct {
 	Ip   uint32
 	Port uint16
 	Pad  uint16
 }
 
-// ctVal mirrors struct conn_meta.
-// C layout: ip(4) port(2) pad(2) backend_idx(4) state(1) pad(1) service_port(2)
 type ctVal struct {
 	Ip          uint32
 	Port        uint16
@@ -461,9 +528,6 @@ type ctVal struct {
 	ServicePort uint16
 }
 
-// patchConntrackRaw scans the conntrack map and rewrites every entry whose
-// BackendIdx == oldIdx to newIdx. Uses named padding fields so encoding/binary
-// reads all fields at the correct offsets.
 func patchConntrackRaw(conntrackMap *ebpf.Map, oldIdx, newIdx uint32) error {
 	type kv struct {
 		k ctKey
@@ -473,17 +537,12 @@ func patchConntrackRaw(conntrackMap *ebpf.Map, oldIdx, newIdx uint32) error {
 	iter := conntrackMap.Iterate()
 	var k ctKey
 	var v ctVal
-	count := 0
 	for iter.Next(&k, &v) {
-		count++
-		fmt.Printf("  conntrack entry: key={ip=%d port=%d} val={BackendIdx=%d State=%d}\n",
-			k.Ip, k.Port, v.BackendIdx, v.State)
 		if v.BackendIdx == oldIdx {
 			v.BackendIdx = newIdx
 			patches = append(patches, kv{k, v})
 		}
 	}
-	fmt.Printf("scanned %d conntrack entries, patched %d: BackendIdx %d → %d\n", count, len(patches), oldIdx, newIdx)
 	if err := iter.Err(); err != nil {
 		return fmt.Errorf("iterate: %w", err)
 	}
@@ -493,6 +552,7 @@ func patchConntrackRaw(conntrackMap *ebpf.Map, oldIdx, newIdx uint32) error {
 			return fmt.Errorf("update: %w", err)
 		}
 	}
+	fmt.Printf("patched %d conntrack entries: BackendIdx %d → %d\n", len(patches), oldIdx, newIdx)
 	return nil
 }
 

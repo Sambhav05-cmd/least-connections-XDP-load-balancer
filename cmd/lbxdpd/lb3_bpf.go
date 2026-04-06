@@ -16,10 +16,8 @@ type lb3Backend struct {
 	_      structs.HostLayout
 	Ip     uint32
 	Port   uint16
-	_      [2]byte
-	Conns  uint32
 	Weight uint16
-	_      [2]byte
+	Conns  uint32
 }
 
 type lb3ConnMeta struct {
